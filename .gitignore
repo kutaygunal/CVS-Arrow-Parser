@@ -1,0 +1,31 @@
+# Build directories
+build/
+out/
+cmake-build-*/
+
+# IDEs
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+
+# Large generated data files (keep small sample.csv only)
+data/*.csv
+!data/sample.csv
+
+# Python cache
+scripts/__pycache__/
+*.pyc
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Compiled artifacts
+*.exe
+*.dll
+*.lib
+*.exp
+*.pdb
+*.ilk

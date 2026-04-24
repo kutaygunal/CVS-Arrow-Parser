@@ -1,3 +1,6 @@
+# Embedded reference repo (autoresearch adaptation lives in autoresearch_csv/)
+/autoresearch/
+
 # Build directories
 build/
 out/

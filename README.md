@@ -12,8 +12,10 @@ A mid-size CUDA/C++ project demonstrating **parallel CSV parsing on the GPU**, d
 | **Row parsing** | One thread / row, sequential char scan | **One warp / row**, `__ballot_sync` delimiter scan | Coalesced loads, far less divergence |
 | **Numeric conversion** | `dev_atol` / `dev_atof` with per-char branching | `fast_atol` / `fast_atof` — branchless | ~2× faster field parse |
 | **Host I/O** | `std::ifstream` | `fread` into reusable pinned buffer | Removes CRT iostream overhead |
-| **Throughput (10 M rows)** | **1 082 MiB/s** | **4 091 MiB/s** | **+278 %** |
-| **Fused filter (10 M rows)** | **1 367 MiB/s** | **4 458 MiB/s** | **+226 %** |
+| **Autonomous tuning** | None | **Autoresearch loop**: parameter sweeps via `experiment_csv.py` | Finds optimal block sizes, strategies |
+| **Multi-stream** | Single stream | **2-stream chunked parsing** for files > 64 MB | Overlaps H2D + compute across chunks |
+| **Throughput (10 M rows)** | **1 082 MiB/s** | **4 117 MiB/s** | **+280 %** |
+| **Fused filter (10 M rows)** | **1 367 MiB/s** | **4 407 MiB/s** | **+222 %** |
 
 > Benchmarked on **RTX 4090 / PCIe 4.0 x16 / CUDA 12.6 / MSVC 2022**.
 
@@ -28,6 +30,8 @@ A mid-size CUDA/C++ project demonstrating **parallel CSV parsing on the GPU**, d
   1. **Stage 1** (`filter_mask_kernel_warp`): warp-level scan finds the predicate field and evaluates.
   2. **Stage 2** (`cub::ExclusiveSum`): compact surviving rows.
   3. **Stage 3** (`parse_filtered_rows_kernel_warp`): warp-level field scan + parse **only** projected columns for survivors.
+* **Multi-stream chunked parsing** — for large files (> 64 MB), the payload is split at newline boundaries and processed on **two concurrent CUDA streams**. H2D of chunk *N+1* overlaps with scan/compact of chunk *N*, improving throughput when single-stream H2D is the bottleneck.
+* **Autoresearch integration** — an adapted version of [karpathy/autoresearch](https://github.com/karpathy/autoresearch) lives in `autoresearch_csv/`. The agent iteratively tunes `experiment_csv.py` (block sizes, parser strategy, stream count), rebuilds, benchmarks for a fixed time budget, and keeps/discards changes based on throughput. A `tuneable_params.h` header lets the agent control compile-time constants without fragile regex surgery on `.cu` files.
 * **Arrow-minded layout** — null bitmaps per column, type-tagged buffers, ready to be zero-copy wrapped into `arrow::Array` extensions.
 
 ## Architecture
@@ -54,6 +58,23 @@ Device (async on persistent CUDA stream):
   │ Fused Filter    │   Stage 1: filter_mask_kernel_warp (predicate only)
   │ Pushdown Path   │   Stage 2: cub::ExclusiveSum
   └─────────────────┘   Stage 3: parse_filtered_rows_kernel_warp (project)
+
+Multi-stream path (large files > 64 MB, full parse only):
+  Host splits payload at newline boundaries
+       │
+       ▼
+  Stream 0:  H2D chunk 0 ──▶ mark/scan/compact chunk 0
+  Stream 1:  H2D chunk 1 ──▶ mark/scan/compact chunk 1   (overlaps with Stream 0)
+       │                            │
+       ▼                            ▼
+  Sync 0 & 1  →  allocate combined output
+       │
+       ▼
+  Stream 0:  parse chunk 0 into combined buffer at row offset 0
+  Stream 1:  parse chunk 1 into combined buffer at row offset N0
+       │
+       ▼
+  Sync 0 & 1  →  return combined ParsedCSV
 ```
 
 ### Memory-management strategy
@@ -68,27 +89,63 @@ Device (async on persistent CUDA stream):
 
 This eliminates **all** per-call `cudaMalloc`/`cudaFree` and `cudaMallocHost`/`cudaFreeHost` overhead.
 
+### 5. Run the autoresearch tuning loop
+
+An adapted [karpathy/autoresearch](https://github.com/karpathy/autoresearch) framework lives in `autoresearch_csv/`. It autonomously edits tunable parameters, rebuilds, benchmarks, and keeps/discards changes based on throughput.
+
+```powershell
+# Establish baseline
+cd autoresearch_csv
+python experiment_csv.py
+
+# Edit experiment_csv.py  →  change TUNABLES  →  re-run
+# The script writes include/tuneable_params.h, rebuilds, and reports throughput.
+```
+
+Current tunables exposed via `include/tuneable_params.h`:
+
+| Macro | Description | Typical range |
+|-------|-------------|---------------|
+| `TUNE_THREADS_PER_BLOCK` | Threads per block for parse kernels | 128 – 512 |
+| `TUNE_MARK_THREADS_PER_BLOCK` | Threads for `mark_newlines` | 128 – 512 |
+| `TUNE_COMPACT_THREADS_PER_BLOCK` | Threads for `compact_newlines` | 128 – 512 |
+| `TUNE_USE_WARP_PARSE` | 1 = warp-per-row, 0 = thread-per-row | 0 or 1 |
+| `TUNE_USE_FAST_PARSER` | 1 = fast branchless, 0 = safe validated | 0 or 1 |
+| `TUNE_MAX_FIELDS_PER_WARP` | Shared-memory field budget | 16 – 64 |
+| `TUNE_USE_WIDE_LOADS` | 1 = uint4 coalesced scan (needs kernel support) | 0 or 1 |
+| `TUNE_NUM_STREAMS` | 1 = single stream, 2 = dual-stream chunking | 1 or 2 |
+| `TUNE_MIN_CHUNK_SIZE_BYTES` | Minimum chunk size for multi-stream | 32 MB |
+
+For this codebase, 256 threads + single stream is empirically optimal on RTX 4090 for the 10 M row benchmark. Multi-stream becomes beneficial for files > 500 MB where H2D time dominates.
+
 ## Directory Layout
 
 ```
 01-csv-arrow-parser/
 ├── CMakeLists.txt
 ├── README.md
-├── data/
-│   ├── sample.csv               # tiny test file (5 rows)
-│   ├── 1M.csv                   # generated: 1 million rows
-│   ├── 5M.csv                   # generated: 5 million rows
-│   └── 10M.csv                  # generated: 10 million rows
+├── include/
+│   ├── gpu_csv_parser.hpp       # public API
+│   └── tuneable_params.h        # autoresearch compile-time tunables
+├── src/
+│   ├── gpu_csv_parser.cu        # CUDA kernels + Impl (single-stream + multi-stream)
+│   └── main.cpp                 # CLI demo
+├── benchmarks/
+│   ├── bench.cu                 # single-file repeated-run benchmark
+│   └── sweep.cu                 # multi-size sweep benchmark
+├── autoresearch_csv/            # adapted karpathy/autoresearch framework
+│   ├── prepare_csv.py           # fixed build + benchmark harness
+│   ├── experiment_csv.py        # agent-editable tunables + experiment loop
+│   └── program_csv.md           # agent instructions
+├── autoresearch/                # original karpathy/autoresearch (reference)
+│   └── ...
 ├── scripts/
 │   └── generate_csv.py          # generate large benchmark files
-├── include/
-│   └── gpu_csv_parser.hpp       # public API
-├── src/
-│   ├── gpu_csv_parser.cu        # CUDA kernels + Impl
-│   └── main.cpp                 # CLI demo
-└── benchmarks/
-    ├── bench.cu                 # single-file repeated-run benchmark
-    └── sweep.cu                 # multi-size sweep benchmark
+└── data/
+    ├── sample.csv               # tiny test file (5 rows)
+    ├── 1M.csv                   # generated: 1 million rows
+    ├── 5M.csv                   # generated: 5 million rows
+    └── 10M.csv                  # generated: 10 million rows
 ```
 
 ## Build Requirements
@@ -169,7 +226,7 @@ Benchmarks all dataset sizes in one shot:
 .\build\Release\csv_parser_sweep.exe
 ```
 
-**Verified output** (RTX 4090 / CUDA 12.6 / Windows, *after* warp-level + fast-parser + buffer-reuse optimisation):
+**Verified output** (RTX 4090 / CUDA 12.6 / Windows, after warp-level + fast-parser + buffer-reuse + autoresearch sweep):
 
 ```
 === GPU CSV Parser: Multi-Size Benchmark ===
@@ -177,18 +234,17 @@ Warmup: 2 | Runs: 10
 
 File              Size(MiB) Rows        Full(ms)  Full(MiB/s) Fused(ms) Fused(MiB/s)  Survivors   Selectivity
 --------------------------------------------------------------------------------------------------------------
-data/sample.csv   0.00      5           0.18      0.4         0.26      0.3           2           0.40       
-data/1M.csv       17.73     1000000     4.40      4029.6      3.93      4512.9        495620      0.50       
-data/5M.csv       92.88     5000000     24.88     3732.6      22.91     4053.5        2474601     0.49       
-data/10M.csv      186.81    10000000    45.78     4080.7      42.18     4428.7        4952096     0.50
+data/1M.csv       17.73     1000000     4.38      4051.4      3.77      4698.9        495620      0.50      
+data/5M.csv       92.88     5000000     24.78     3748.6      25.05     3708.0        2474601     0.49      
+data/10M.csv      186.81    10000000    45.37     4117.2      42.39     4407.0        4952096     0.50
 ```
 
 Throughput **scales linearly** with dataset size — the parser is end-to-end throughput bound.
 
 | Mode | 10 M rows throughput | Speed-up vs baseline |
 |------|------------------|-------------------|
-| Full parse | **4 091 MiB/s** | **+278 %** |
-| Fused filter | **4 458 MiB/s** | **+226 %** |
+| Full parse | **4 117 MiB/s** | **+280 %** |
+| Fused filter | **4 407 MiB/s** | **+222 %** |
 
 ### 4. Run the single-file benchmark
 

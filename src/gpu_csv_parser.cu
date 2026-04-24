@@ -1,4 +1,5 @@
 #include "gpu_csv_parser.hpp"
+#include "tuneable_params.h"
 
 #include <cub/cub.cuh>
 #include <cuda_runtime.h>
@@ -479,12 +480,14 @@ static void ensure_buffer(void** d_ptr, size_t* current_cap, size_t required) {
 // ---------------------------------------------------------------------------
 class CSVParser::Impl {
     cudaStream_t stream_ = nullptr;
+    cudaStream_t stream2_ = nullptr;
 
     // Reusable device buffers (resized on demand)
     char* d_data_ = nullptr;       size_t d_data_cap_ = 0;
     uint8_t* d_marks_ = nullptr;    size_t d_marks_cap_ = 0;
     uint32_t* d_cumsum_ = nullptr;  size_t d_cumsum_cap_ = 0;
     void* d_temp_ = nullptr;        size_t d_temp_cap_ = 0;
+    void* d_temp2_ = nullptr;       size_t d_temp2_cap_ = 0;
     int64_t* d_newlines_ = nullptr; size_t d_newlines_cap_ = 0;
     uint8_t* d_mask_ = nullptr;     size_t d_mask_cap_ = 0;
     int* d_scanned_ = nullptr;      size_t d_scanned_cap_ = 0;
@@ -502,7 +505,8 @@ class CSVParser::Impl {
     void ensure_data_(size_t n)     { ensure_buffer((void**)&d_data_,     &d_data_cap_,     n); }
     void ensure_marks_(size_t n)    { ensure_buffer((void**)&d_marks_,    &d_marks_cap_,    n); }
     void ensure_cumsum_(size_t n)   { ensure_buffer((void**)&d_cumsum_,   &d_cumsum_cap_,   n * sizeof(uint32_t)); }
-    void ensure_temp_(size_t n)     { ensure_buffer((void**)&d_temp_,     &d_temp_cap_,     n); }
+    void ensure_temp_(size_t n)   { ensure_buffer((void**)&d_temp_,     &d_temp_cap_,     n); }
+    void ensure_temp2_(size_t n)  { ensure_buffer((void**)&d_temp2_,    &d_temp2_cap_,    n); }
     void ensure_newlines_(size_t n) { ensure_buffer((void**)&d_newlines_, &d_newlines_cap_, n * sizeof(int64_t)); }
     void ensure_mask_(size_t n)     { ensure_buffer((void**)&d_mask_,     &d_mask_cap_,     n * sizeof(uint8_t)); }
     void ensure_scanned_(size_t n)  { ensure_buffer((void**)&d_scanned_,  &d_scanned_cap_,  n * sizeof(int)); }
@@ -516,17 +520,240 @@ class CSVParser::Impl {
 public:
     Impl() {
         CUDA_CHECK(cudaStreamCreate(&stream_));
+        CUDA_CHECK(cudaStreamCreate(&stream2_));
     }
     ~Impl() {
         if (d_data_)     cudaFree(d_data_);
         if (d_marks_)    cudaFree(d_marks_);
         if (d_cumsum_)   cudaFree(d_cumsum_);
         if (d_temp_)     cudaFree(d_temp_);
+        if (d_temp2_)    cudaFree(d_temp2_);
         if (d_newlines_) cudaFree(d_newlines_);
         if (d_mask_)     cudaFree(d_mask_);
         if (d_scanned_)  cudaFree(d_scanned_);
         if (h_pinned_buf_) cudaFreeHost(h_pinned_buf_);
         if (stream_)     cudaStreamDestroy(stream_);
+        if (stream2_)    cudaStreamDestroy(stream2_);
+    }
+
+    ParsedCSV parse_multistream(const char* h_pinned,
+                                 size_t data_offset,
+                                 size_t payload_size,
+                                 const ParseOptions& opts) {
+        using clock = std::chrono::high_resolution_clock;
+        ParsedCSV result;
+        result.num_rows = 0;
+        result.num_filtered_rows = 0;
+        result.parse_time_ms = 0.0;
+        result.h2d_time_ms = 0.0;
+
+        const int num_streams = TUNE_NUM_STREAMS;
+        if (num_streams < 2 || payload_size < static_cast<size_t>(TUNE_MIN_CHUNK_SIZE_BYTES) * 2) {
+            return result; // signal caller to fall back
+        }
+
+        // Ensure buffers before multistream path
+        ensure_data_(payload_size);
+        ensure_marks_(payload_size);
+        ensure_cumsum_(payload_size);
+
+        // Split payload into chunks at newline boundaries
+        std::vector<size_t> chunk_off(num_streams);
+        std::vector<size_t> chunk_sz(num_streams);
+        size_t cursor = data_offset;
+        size_t remaining = payload_size;
+        for (int i = 0; i < num_streams; ++i) {
+            if (i == num_streams - 1) {
+                chunk_off[i] = cursor - data_offset;
+                chunk_sz[i] = remaining;
+            } else {
+                size_t target = remaining / (num_streams - i);
+                const char* base = h_pinned + cursor;
+                size_t pos = target;
+                while (pos < remaining && base[pos] != '\n') ++pos;
+                if (pos < remaining) pos += 1;
+                chunk_off[i] = cursor - data_offset;
+                chunk_sz[i] = pos;
+                cursor += pos;
+                remaining -= pos;
+            }
+        }
+
+        size_t max_chunk = 0;
+        for (size_t s : chunk_sz) if (s > max_chunk) max_chunk = s;
+
+        size_t temp_bytes = 0;
+        cub::DeviceScan::InclusiveSum(nullptr, temp_bytes, d_marks_, d_cumsum_,
+                                        static_cast<int>(max_chunk));
+        ensure_temp_(temp_bytes);
+        ensure_temp2_(temp_bytes);
+
+        cudaStream_t streams[4] = {stream_, stream2_, nullptr, nullptr};
+        void* temps[4] = {d_temp_, d_temp2_, nullptr, nullptr};
+
+        // Phase 1: H2D + mark + scan concurrently
+        std::vector<int64_t> chunk_rows(num_streams, 0);
+        std::vector<uint32_t> h_last_cumsum(num_streams, 0);
+        std::vector<uint32_t*> d_chunk_cumsum(num_streams);
+        std::vector<int64_t*> d_chunk_nl(num_streams);
+        std::vector<bool> chunk_ends_nl(num_streams);
+
+        for (int s = 0; s < num_streams; ++s) {
+            size_t csz = chunk_sz[s];
+            size_t coff = chunk_off[s];
+            cudaStream_t st = streams[s];
+
+            CUDA_CHECK(cudaMemcpyAsync(d_data_ + coff, h_pinned + data_offset + coff,
+                                       csz, cudaMemcpyHostToDevice, st));
+
+            int threads = TUNE_MARK_THREADS_PER_BLOCK;
+            int blocks = static_cast<int>((csz + threads - 1) / threads);
+            mark_newlines<<<blocks, threads, 0, st>>>(d_data_ + coff, csz, d_marks_ + coff);
+            CUDA_CHECK(cudaGetLastError());
+
+            d_chunk_cumsum[s] = d_cumsum_ + coff;
+            cub::DeviceScan::InclusiveSum(temps[s], temp_bytes,
+                                          d_marks_ + coff, d_chunk_cumsum[s],
+                                          static_cast<int>(csz), st);
+            CUDA_CHECK(cudaGetLastError());
+
+            CUDA_CHECK(cudaMemcpyAsync(&h_last_cumsum[s], d_chunk_cumsum[s] + csz - 1,
+                                       sizeof(uint32_t), cudaMemcpyDeviceToHost, st));
+        }
+
+        for (int s = 0; s < num_streams; ++s) {
+            CUDA_CHECK(cudaStreamSynchronize(streams[s]));
+        }
+
+        // Compact newlines per chunk
+        for (int s = 0; s < num_streams; ++s) {
+            size_t csz = chunk_sz[s];
+            size_t coff = chunk_off[s];
+            cudaStream_t st = streams[s];
+            uint32_t nl = h_last_cumsum[s];
+            if (nl == 0) {
+                d_chunk_nl[s] = nullptr;
+                chunk_rows[s] = 0;
+                chunk_ends_nl[s] = false;
+                continue;
+            }
+            bool ends = false;
+            if (csz > 0) {
+                char lc = h_pinned[data_offset + coff + csz - 1];
+                ends = (lc == '\n');
+            }
+            chunk_ends_nl[s] = ends;
+            chunk_rows[s] = static_cast<int64_t>(nl);
+            if (!ends) chunk_rows[s] += 1;
+
+            CUDA_CHECK(cudaMalloc(&d_chunk_nl[s], (chunk_rows[s] + 1) * sizeof(int64_t)));
+            int threads = TUNE_COMPACT_THREADS_PER_BLOCK;
+            int blocks = static_cast<int>((csz + threads - 1) / threads);
+            compact_newlines<<<blocks, threads, 0, st>>>(d_data_ + coff, csz,
+                                                                d_chunk_cumsum[s], d_chunk_nl[s]);
+            CUDA_CHECK(cudaGetLastError());
+
+            if (!ends) {
+                int64_t end_off = static_cast<int64_t>(csz);
+                CUDA_CHECK(cudaMemcpyAsync(d_chunk_nl[s] + nl, &end_off,
+                                           sizeof(int64_t), cudaMemcpyHostToDevice, st));
+            }
+        }
+
+        int num_cols = static_cast<int>(opts.schema.size());
+        int64_t total_rows = 0;
+        for (auto r : chunk_rows) total_rows += r;
+        if (total_rows == 0) {
+            for (int s = 0; s < num_streams; ++s) if (d_chunk_nl[s]) cudaFree(d_chunk_nl[s]);
+            return result;
+        }
+
+        // Allocate combined output columns
+        std::vector<void*> h_col_data(num_cols);
+        std::vector<uint8_t*> h_col_nulls(num_cols);
+        for (int c = 0; c < num_cols; ++c) {
+            size_t bsize = static_cast<size_t>(total_rows) * type_size(opts.schema[c].type);
+            void* dp = nullptr;
+            uint8_t* np = nullptr;
+            CUDA_CHECK(cudaMalloc(&dp, bsize));
+            CUDA_CHECK(cudaMalloc(&np, total_rows * sizeof(uint8_t)));
+            h_col_data[c] = dp;
+            h_col_nulls[c] = np;
+        }
+
+        std::vector<ColumnType> host_types;
+        host_types.reserve(num_cols);
+        for (const auto& spec : opts.schema) host_types.push_back(spec.type);
+
+        // Phase 2: Parse each chunk into combined buffers concurrently
+        for (int s = 0; s < num_streams; ++s) {
+            if (chunk_rows[s] == 0) continue;
+            size_t csz = chunk_sz[s];
+            size_t coff = chunk_off[s];
+            cudaStream_t st = streams[s];
+            int64_t row_offset = 0;
+            for (int j = 0; j < s; ++j) row_offset += chunk_rows[j];
+
+            std::vector<void*> h_chunk_data(num_cols);
+            std::vector<uint8_t*> h_chunk_nulls(num_cols);
+            for (int c = 0; c < num_cols; ++c) {
+                size_t ts = type_size(opts.schema[c].type);
+                h_chunk_data[c] = static_cast<uint8_t*>(h_col_data[c]) + row_offset * ts;
+                h_chunk_nulls[c] = h_col_nulls[c] + row_offset;
+            }
+
+            void** d_chunk_data = nullptr;
+            uint8_t** d_chunk_nulls = nullptr;
+            ColumnType* d_types = nullptr;
+            CUDA_CHECK(cudaMalloc(&d_chunk_data, num_cols * sizeof(void*)));
+            CUDA_CHECK(cudaMalloc(&d_chunk_nulls, num_cols * sizeof(uint8_t*)));
+            CUDA_CHECK(cudaMalloc(&d_types, num_cols * sizeof(ColumnType)));
+            CUDA_CHECK(cudaMemcpyAsync(d_chunk_data, h_chunk_data.data(),
+                                       num_cols * sizeof(void*), cudaMemcpyHostToDevice, st));
+            CUDA_CHECK(cudaMemcpyAsync(d_chunk_nulls, h_chunk_nulls.data(),
+                                       num_cols * sizeof(uint8_t*), cudaMemcpyHostToDevice, st));
+            CUDA_CHECK(cudaMemcpyAsync(d_types, host_types.data(),
+                                       num_cols * sizeof(ColumnType), cudaMemcpyHostToDevice, st));
+
+            constexpr int WARP_THREADS = 32;
+            constexpr int THREADS_PER_BLOCK = TUNE_THREADS_PER_BLOCK;
+            int warps_per_block = THREADS_PER_BLOCK / WARP_THREADS;
+            int blocks = static_cast<int>((chunk_rows[s] + warps_per_block - 1) / warps_per_block);
+
+            parse_rows_kernel_warp<<<blocks, THREADS_PER_BLOCK, 0, st>>>(
+                d_data_ + coff, d_chunk_nl[s], chunk_rows[s],
+                chunk_ends_nl[s], static_cast<int64_t>(csz), opts.delimiter,
+                num_cols, d_types, d_chunk_data, d_chunk_nulls);
+            CUDA_CHECK(cudaGetLastError());
+
+            cudaFree(d_chunk_data);
+            cudaFree(d_chunk_nulls);
+            cudaFree(d_types);
+        }
+
+        for (int s = 0; s < num_streams; ++s) {
+            CUDA_CHECK(cudaStreamSynchronize(streams[s]));
+        }
+
+        // Assemble result
+        result.num_rows = static_cast<size_t>(total_rows);
+        result.columns.reserve(num_cols);
+        for (int c = 0; c < num_cols; ++c) {
+            DeviceColumn col;
+            col.type = opts.schema[c].type;
+            col.num_rows = static_cast<size_t>(total_rows);
+            col.data_bytes = col.num_rows * type_size(col.type);
+            col.data = std::unique_ptr<void, void (*)(void*)>(
+                h_col_data[c], +[](void* p) { cudaFree(p); });
+            col.null_mask = std::unique_ptr<uint8_t, void (*)(void*)>(
+                h_col_nulls[c], +[](void* p) { cudaFree(p); });
+            result.columns.push_back(std::move(col));
+        }
+
+        for (int s = 0; s < num_streams; ++s) {
+            if (d_chunk_nl[s]) cudaFree(d_chunk_nl[s]);
+        }
+        return result;
     }
 
     ParsedCSV parse(const std::string& filepath, const ParseOptions& opts) {
@@ -567,6 +794,16 @@ public:
                 "Chunked streaming mode will be added in a future update.");
         }
 
+        // Try multi-stream path first for large payloads
+        if (!opts.fused_filter && TUNE_NUM_STREAMS >= 2) {
+            auto ms_result = parse_multistream(h_pinned, data_offset, payload_size, opts);
+            if (ms_result.num_rows > 0) {
+                ms_result.parse_time_ms = std::chrono::duration<double, std::milli>(
+                    clock::now() - t0).count();
+                return ms_result;
+            }
+        }
+
         ParsedCSV result;
         result.num_rows = 0;
         result.num_filtered_rows = 0;
@@ -585,7 +822,7 @@ public:
 
         // 3. Mark newlines on stream
         {
-            int threads = 256;
+            int threads = TUNE_MARK_THREADS_PER_BLOCK;
             int blocks = static_cast<int>((payload_size + threads - 1) / threads);
             mark_newlines<<<blocks, threads, 0, stream_>>>(d_data_, payload_size, d_marks_);
             CUDA_CHECK(cudaGetLastError());
@@ -616,7 +853,7 @@ public:
         ensure_newlines_(h_total_nl + 1);
         int64_t* d_newlines = d_newlines_;
         {
-            int threads = 256;
+            int threads = TUNE_COMPACT_THREADS_PER_BLOCK;
             int blocks = static_cast<int>((payload_size + threads - 1) / threads);
             compact_newlines<<<blocks, threads, 0, stream_>>>(d_data_, payload_size,
                                                                 d_cumsum_, d_newlines);
@@ -657,7 +894,7 @@ public:
 
         // Warp kernel config: 128 threads = 4 warps/block gives good occupancy
         constexpr int WARP_THREADS = 32;
-        constexpr int THREADS_PER_BLOCK = 256;
+        constexpr int THREADS_PER_BLOCK = TUNE_THREADS_PER_BLOCK;
         int warps_per_block = THREADS_PER_BLOCK / WARP_THREADS;
 
         if (opts.fused_filter) {

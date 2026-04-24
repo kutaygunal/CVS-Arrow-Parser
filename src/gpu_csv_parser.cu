@@ -6,7 +6,6 @@
 
 #include <cstdint>
 #include <cstdio>
-
 #include <fstream>
 #include <iostream>
 #include <memory>
@@ -48,7 +47,47 @@ std::vector<uint8_t> DeviceColumn::copy_rows_to_host(std::size_t start,
 }
 
 // ---------------------------------------------------------------------------
-// Device parsing primitives (no locale, no exponent, simple but fast)
+// Fast device parsing primitives -- assumes well-formed simple data, no
+// locale, no exponent, no NaN/Inf.  Empty fields are handled by the caller.
+// ---------------------------------------------------------------------------
+__device__ __forceinline__ int64_t fast_atol(const char* s, const char* e) {
+    bool neg = (*s == '-');
+    s += neg;
+    int64_t val = 0;
+    #pragma unroll 8
+    for (; s < e; ++s) {
+        val = val * 10 + (*s - '0');
+    }
+    return neg ? -val : val;
+}
+
+__device__ __forceinline__ double fast_atof(const char* s, const char* e) {
+    bool neg = (*s == '-');
+    s += neg;
+
+    int64_t int_part = 0;
+    const char* dot = nullptr;
+    for (const char* p = s; p < e; ++p) {
+        if (*p == '.') { dot = p; break; }
+        int_part = int_part * 10 + (*p - '0');
+    }
+
+    double val = double(int_part);
+    if (dot) {
+        int64_t frac = 0;
+        int64_t div  = 1;
+        #pragma unroll 8
+        for (const char* p = dot + 1; p < e; ++p) {
+            frac = frac * 10 + (*p - '0');
+            div *= 10;
+        }
+        val += double(frac) / double(div);
+    }
+    return neg ? -val : val;
+}
+
+// ---------------------------------------------------------------------------
+// Safe / general parsers (kept for fallback / non-fast paths)
 // ---------------------------------------------------------------------------
 __device__ __forceinline__ int64_t dev_atol(const char* s, const char* e,
                                             bool* ok) {
@@ -127,7 +166,114 @@ __device__ __forceinline__ bool eval_predicate_float64(double val,
 }
 
 // ---------------------------------------------------------------------------
-// Row discovery kernels
+// Warp-level helpers: one warp collaboratively scans a single CSV row.
+// ---------------------------------------------------------------------------
+
+// Find the begin/end offsets (relative to `data`) of ONE field.
+// Every thread in the calling warp participates.  Only lane 0 returns valid
+// *out_b / *out_e, and the return value is broadcast.
+__device__ __forceinline__ bool warp_find_field(
+    const char* data,
+    int64_t row_start,
+    int64_t row_end,
+    char delimiter,
+    int target_field,
+    int* out_b,
+    int* out_e)
+{
+    int lane = threadIdx.x & 31;
+    int fb = static_cast<int>(row_start);   // current field begin
+    int field_idx = 0;
+    int64_t chunk = row_start;
+    bool found = false;
+    int ob = 0, oe = 0;
+
+    while (chunk < row_end) {
+        int64_t pos = chunk + lane;
+        char c = (pos < row_end) ? data[pos] : 0;
+        unsigned int delim_mask = __ballot_sync(0xFFFFFFFF, c == delimiter);
+
+        if (lane == 0) {
+            unsigned int m = delim_mask;
+            while (m) {
+                int d = __ffs(static_cast<int>(m)) - 1;
+                if (field_idx == target_field) {
+                    ob = fb;
+                    oe = static_cast<int>(chunk + d);
+                    found = true;
+                    break;
+                }
+                fb = static_cast<int>(chunk + d) + 1;
+                ++field_idx;
+                m &= m - 1;
+            }
+        }
+        if (found) break;
+        chunk += 32;
+    }
+
+    if (lane == 0 && !found && field_idx == target_field && fb < row_end) {
+        ob = fb;
+        oe = static_cast<int>(row_end);
+        found = true;
+    }
+
+    // Broadcast result to all lanes (so callers can branch uniformly)
+    int found_i = __shfl_sync(0xFFFFFFFF, found ? 1 : 0, 0);
+    if (found_i) {
+        *out_b = __shfl_sync(0xFFFFFFFF, ob, 0);
+        *out_e = __shfl_sync(0xFFFFFFFF, oe, 0);
+    }
+    return found_i != 0;
+}
+
+// Scan all fields of a row and store their begin/end offsets.
+// `f_begin` / `f_end` must live in shared memory or per-thread arrays with
+// at least `max_fields` entries.  Returns field count (broadcast to all lanes).
+__device__ __forceinline__ int warp_scan_fields(
+    const char* data,
+    int64_t row_start,
+    int64_t row_end,
+    char delimiter,
+    int max_fields,
+    int* f_begin,
+    int* f_end)
+{
+    int lane = threadIdx.x & 31;
+    int fb = static_cast<int>(row_start);
+    int field_idx = 0;
+    int64_t chunk = row_start;
+
+    while (chunk < row_end && field_idx < max_fields) {
+        int64_t pos = chunk + lane;
+        char c = (pos < row_end) ? data[pos] : 0;
+        unsigned int delim_mask = __ballot_sync(0xFFFFFFFF, c == delimiter);
+
+        if (lane == 0) {
+            unsigned int m = delim_mask;
+            while (m && field_idx < max_fields) {
+                int d = __ffs(static_cast<int>(m)) - 1;
+                f_begin[field_idx] = fb;
+                f_end[field_idx]   = static_cast<int>(chunk + d);
+                fb = static_cast<int>(chunk + d) + 1;
+                ++field_idx;
+                m &= m - 1;
+            }
+        }
+        chunk += 32;
+    }
+
+    if (lane == 0 && field_idx < max_fields && fb < row_end) {
+        f_begin[field_idx] = fb;
+        f_end[field_idx]   = static_cast<int>(row_end);
+        ++field_idx;
+    }
+
+    return __shfl_sync(0xFFFFFFFF, field_idx, 0);
+}
+
+// ---------------------------------------------------------------------------
+// Row discovery kernels (unchanged, already coalesced and fast)
 // ---------------------------------------------------------------------------
 __global__ void mark_newlines(const char* data, size_t n, uint8_t* marks) {
     size_t i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -145,211 +291,176 @@ __global__ void compact_newlines(const char* data, size_t n,
 }
 
 // ---------------------------------------------------------------------------
-// Full parse kernel (no filter)
+// Full parse kernel -- one warp per row, warp-level field scan
 // ---------------------------------------------------------------------------
-__global__ void parse_rows_kernel(const char* data,
-                                  const int64_t* newlines,
-                                  int64_t num_rows,
-                                  bool ends_with_newline,
-                                  int64_t file_size,
-                                  char delimiter,
-                                  int num_cols,
-                                  const ColumnType* types,
-                                  void** col_data,
-                                  uint8_t** col_nulls) {
-    int64_t row = blockIdx.x * blockDim.x + threadIdx.x;
-    if (row >= num_rows) return;
+__global__ void parse_rows_kernel_warp(const char* data,
+                                        const int64_t* newlines,
+                                        int64_t num_rows,
+                                        bool ends_with_newline,
+                                        int64_t file_size,
+                                        char delimiter,
+                                        int num_cols,
+                                        const ColumnType* types,
+                                        void** col_data,
+                                        uint8_t** col_nulls) {
+    int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    int lane    = threadIdx.x & 31;
+    if (warp_id >= num_rows) return;
+    int64_t row = warp_id;
 
     int64_t start = (row == 0) ? 0 : (newlines[row - 1] + 1);
     int64_t end   = newlines[row];
     if (!ends_with_newline && row == num_rows - 1) end = file_size;
-
-    // trim trailing \r if present
     if (end > start && data[end - 1] == '\r') --end;
 
-    const char* fb = data + start;
-    int field = 0;
+    // Shared memory scratch for this warp's field boundaries
+    __shared__ int s_f_b[32 * 32]; // max 32 warps * 32 fields
+    __shared__ int s_f_e[32 * 32];
+    int warp_slot = (threadIdx.x >> 5) * 32;
+    int* f_b = s_f_b + warp_slot;
+    int* f_e = s_f_e + warp_slot;
 
-    for (int64_t p = start; p < end && field < num_cols; ++p) {
-        if (data[p] == delimiter) {
-            const char* fe = data + p;
-            bool ok = false;
-            if (fb < fe) {
-                switch (types[field]) {
+    int nf = warp_scan_fields(data, start, end, delimiter, num_cols, f_b, f_e);
+
+    if (lane == 0) {
+        for (int c = 0; c < num_cols; ++c) {
+            if (c >= nf) {
+                col_nulls[c][row] = 0;
+                continue;
+            }
+            bool has = (f_b[c] < f_e[c]);
+            if (has) {
+                switch (types[c]) {
                     case ColumnType::INT64: {
-                        int64_t v = dev_atol(fb, fe, &ok);
-                        if (ok) reinterpret_cast<int64_t*>(col_data[field])[row] = v;
+                        reinterpret_cast<int64_t*>(col_data[c])[row] =
+                            fast_atol(data + f_b[c], data + f_e[c]);
                         break;
                     }
                     case ColumnType::FLOAT64: {
-                        double v = dev_atof(fb, fe, &ok);
-                        if (ok) reinterpret_cast<double*>(col_data[field])[row] = v;
+                        reinterpret_cast<double*>(col_data[c])[row] =
+                            fast_atof(data + f_b[c], data + f_e[c]);
                         break;
                     }
                 }
             }
-            col_nulls[field][row] = ok ? 1 : 0;
-            ++field;
-            fb = data + p + 1;
+            col_nulls[c][row] = has ? 1 : 0;
         }
-    }
-
-    // Last field
-    if (field < num_cols) {
-        const char* fe = data + end;
-        bool ok = false;
-        if (fb < fe) {
-            switch (types[field]) {
-                case ColumnType::INT64: {
-                    int64_t v = dev_atol(fb, fe, &ok);
-                    if (ok) reinterpret_cast<int64_t*>(col_data[field])[row] = v;
-                    break;
-                }
-                case ColumnType::FLOAT64: {
-                    double v = dev_atof(fb, fe, &ok);
-                    if (ok) reinterpret_cast<double*>(col_data[field])[row] = v;
-                    break;
-                }
-            }
-        }
-        col_nulls[field][row] = ok ? 1 : 0;
-    }
-
-    // Null out any missing columns (malformed row shorter than schema)
-    for (int f = field + 1; f < num_cols; ++f) {
-        col_nulls[f][row] = 0;
     }
 }
 
 // ---------------------------------------------------------------------------
-// Fused filter: Stage 1 — evaluate predicate per row
+// Fused filter: Stage 1 -- evaluate predicate per row (warp per row)
 // ---------------------------------------------------------------------------
-__global__ void filter_mask_kernel(const char* data,
-                                   const int64_t* newlines,
-                                   int64_t num_rows,
-                                   bool ends_with_newline,
-                                   int64_t file_size,
-                                   char delimiter,
-                                   int predicate_col,
-                                   ColumnType predicate_type,
-                                   PredicateOp op,
-                                   int64_t pred_i64,
-                                   double pred_f64,
-                                   uint8_t* mask) {
-    int64_t row = blockIdx.x * blockDim.x + threadIdx.x;
-    if (row >= num_rows) return;
+__global__ void filter_mask_kernel_warp(const char* data,
+                                         const int64_t* newlines,
+                                         int64_t num_rows,
+                                         bool ends_with_newline,
+                                         int64_t file_size,
+                                         char delimiter,
+                                         int predicate_col,
+                                         ColumnType predicate_type,
+                                         PredicateOp op,
+                                         int64_t pred_i64,
+                                         double pred_f64,
+                                         uint8_t* mask) {
+    int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    int lane    = threadIdx.x & 31;
+    if (warp_id >= num_rows) return;
+    int64_t row = warp_id;
 
     int64_t start = (row == 0) ? 0 : (newlines[row - 1] + 1);
     int64_t end   = newlines[row];
     if (!ends_with_newline && row == num_rows - 1) end = file_size;
     if (end > start && data[end - 1] == '\r') --end;
 
-    // Scan to predicate column
-    const char* fb = data + start;
-    int field = 0;
-    bool found = false;
-    bool ok = false;
-    int64_t vi = 0;
-    double vd = 0.0;
-
-    for (int64_t p = start; p < end && field <= predicate_col; ++p) {
-        if (data[p] == delimiter || p == end - 1) {
-            const char* fe = (data[p] == delimiter) ? (data + p) : (data + p + 1);
-            if (field == predicate_col) {
-                if (fb < fe) {
-                    if (predicate_type == ColumnType::INT64) {
-                        vi = dev_atol(fb, fe, &ok);
-                    } else {
-                        vd = dev_atof(fb, fe, &ok);
-                    }
-                }
-                found = true; break;
-            }
-            ++field;
-            fb = data + p + 1;
-        }
-    }
+    int fb = 0, fe = 0;
+    bool found = warp_find_field(data, start, end, delimiter,
+                                  predicate_col, &fb, &fe);
 
     bool pass = false;
-    if (found && ok) {
-        if (predicate_type == ColumnType::INT64)
-            pass = eval_predicate_int64(vi, op, pred_i64);
-        else
-            pass = eval_predicate_float64(vd, op, pred_f64);
+    if (lane == 0) {
+        if (found && fb < fe) {
+            if (predicate_type == ColumnType::INT64) {
+                int64_t v = fast_atol(data + fb, data + fe);
+                pass = eval_predicate_int64(v, op, pred_i64);
+            } else {
+                double v = fast_atof(data + fb, data + fe);
+                pass = eval_predicate_float64(v, op, pred_f64);
+            }
+        }
     }
-    mask[row] = pass ? 1 : 0;
+
+    unsigned int pass_mask = __ballot_sync(0xFFFFFFFF, lane == 0 ? pass : false);
+    if (lane == 0) mask[row] = (pass_mask != 0) ? 1 : 0;
 }
 
 // ---------------------------------------------------------------------------
-// Fused filter: Stage 2 — parse projected columns for surviving rows only
+// Fused filter: Stage 2 -- parse projected columns for surviving rows
+// Uses warp-level field scan and writes output using precomputed d_scanned.
 // ---------------------------------------------------------------------------
-__global__ void parse_filtered_rows_kernel(const char* data,
-                                          const int64_t* newlines,
-                                          int64_t num_rows,
-                                          bool ends_with_newline,
-                                          int64_t file_size,
-                                          char delimiter,
-                                          int num_proj_cols,
-                                          const int* proj_indices,
-                                          const ColumnType* types,
-                                          const uint8_t* mask,
-                                          const int* scanned,
-                                          void** col_data,
-                                          uint8_t** col_nulls) {
-    int64_t row = blockIdx.x * blockDim.x + threadIdx.x;
-    if (row >= num_rows) return;
+__global__ void parse_filtered_rows_kernel_warp(const char* data,
+                                                const int64_t* newlines,
+                                                int64_t num_rows,
+                                                bool ends_with_newline,
+                                                int64_t file_size,
+                                                char delimiter,
+                                                int num_proj_cols,
+                                                const int* proj_indices,
+                                                const ColumnType* types,
+                                                const uint8_t* mask,
+                                                const int* scanned,
+                                                void** col_data,
+                                                uint8_t** col_nulls) {
+    int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    int lane    = threadIdx.x & 31;
+    if (warp_id >= num_rows) return;
+    int64_t row = warp_id;
+
     if (!mask[row]) return;
 
-    int out_row = scanned[row];
+    // Coalesce the scanned offset read through lane 0 + shfl
+    int out_row = 0;
+    if (lane == 0) out_row = scanned[row];
+    out_row = __shfl_sync(0xFFFFFFFF, out_row, 0);
+
     int64_t start = (row == 0) ? 0 : (newlines[row - 1] + 1);
     int64_t end   = newlines[row];
     if (!ends_with_newline && row == num_rows - 1) end = file_size;
     if (end > start && data[end - 1] == '\r') --end;
 
-    // Pre-compute all field boundaries for this row (small, stack alloc)
-    const int MAX_COLS = 32;
-    const char* f_begin[MAX_COLS];
-    const char* f_end[MAX_COLS];
-    int fcount = 0;
-    const char* fb = data + start;
-    for (int64_t p = start; p < end && fcount < MAX_COLS; ++p) {
-        if (data[p] == delimiter) {
-            f_begin[fcount] = fb;
-            f_end[fcount]   = data + p;
-            ++fcount;
-            fb = data + p + 1;
-        }
-    }
-    if (fcount < MAX_COLS) {
-        f_begin[fcount] = fb;
-        f_end[fcount]   = data + end;
-        ++fcount;
-    }
+    __shared__ int s_f_b[32 * 32];
+    __shared__ int s_f_e[32 * 32];
+    int warp_slot = (threadIdx.x >> 5) * 32;
+    int* f_b = s_f_b + warp_slot;
+    int* f_e = s_f_e + warp_slot;
 
-    for (int pj = 0; pj < num_proj_cols; ++pj) {
-        int col = proj_indices[pj];
-        if (col >= fcount) {
-            col_nulls[pj][out_row] = 0;
-            continue;
-        }
-        bool ok = false;
-        const char* b = f_begin[col];
-        const char* e = f_end[col];
-        if (b < e) {
-            switch (types[pj]) {
-                case ColumnType::INT64: {
-                    int64_t v = dev_atol(b, e, &ok);
-                    if (ok) reinterpret_cast<int64_t*>(col_data[pj])[out_row] = v;
-                    break;
-                }
-                case ColumnType::FLOAT64: {
-                    double v = dev_atof(b, e, &ok);
-                    if (ok) reinterpret_cast<double*>(col_data[pj])[out_row] = v;
-                    break;
+    int nf = warp_scan_fields(data, start, end, delimiter,
+                              32, f_b, f_e);
+
+    if (lane == 0) {
+        for (int pj = 0; pj < num_proj_cols; ++pj) {
+            int col = proj_indices[pj];
+            if (col >= nf) {
+                col_nulls[pj][out_row] = 0;
+                continue;
+            }
+            bool has = (f_b[col] < f_e[col]);
+            if (has) {
+                switch (types[pj]) {
+                    case ColumnType::INT64: {
+                        reinterpret_cast<int64_t*>(col_data[pj])[out_row] =
+                            fast_atol(data + f_b[col], data + f_e[col]);
+                        break;
+                    }
+                    case ColumnType::FLOAT64: {
+                        reinterpret_cast<double*>(col_data[pj])[out_row] =
+                            fast_atof(data + f_b[col], data + f_e[col]);
+                        break;
+                    }
                 }
             }
+            col_nulls[pj][out_row] = has ? 1 : 0;
         }
-        col_nulls[pj][out_row] = ok ? 1 : 0;
     }
 }
 
@@ -371,43 +482,73 @@ class CSVParser::Impl {
 
     // Reusable device buffers (resized on demand)
     char* d_data_ = nullptr;       size_t d_data_cap_ = 0;
-    uint8_t* d_marks_ = nullptr;  size_t d_marks_cap_ = 0;
-    uint32_t* d_cumsum_ = nullptr; size_t d_cumsum_cap_ = 0;
-    void* d_temp_ = nullptr;      size_t d_temp_cap_ = 0;
+    uint8_t* d_marks_ = nullptr;    size_t d_marks_cap_ = 0;
+    uint32_t* d_cumsum_ = nullptr;  size_t d_cumsum_cap_ = 0;
+    void* d_temp_ = nullptr;        size_t d_temp_cap_ = 0;
+    int64_t* d_newlines_ = nullptr; size_t d_newlines_cap_ = 0;
+    uint8_t* d_mask_ = nullptr;     size_t d_mask_cap_ = 0;
+    int* d_scanned_ = nullptr;      size_t d_scanned_cap_ = 0;
 
-    void ensure_data_(size_t n)   { ensure_buffer((void**)&d_data_,   &d_data_cap_,   n); }
-    void ensure_marks_(size_t n)  { ensure_buffer((void**)&d_marks_,  &d_marks_cap_,  n); }
-    void ensure_cumsum_(size_t n) { ensure_buffer((void**)&d_cumsum_, &d_cumsum_cap_, n * sizeof(uint32_t)); }
-    void ensure_temp_(size_t n)   { ensure_buffer((void**)&d_temp_,  &d_temp_cap_,   n); }
+    // Reusable pinned host buffer
+    char* h_pinned_buf_ = nullptr; size_t h_pinned_cap_ = 0;
+
+    void ensure_buffer(void** d_ptr, size_t* current_cap, size_t required) {
+        if (*current_cap >= required) return;
+        if (*d_ptr) CUDA_CHECK(cudaFree(*d_ptr));
+        CUDA_CHECK(cudaMalloc(d_ptr, required));
+        *current_cap = required;
+    }
+
+    void ensure_data_(size_t n)     { ensure_buffer((void**)&d_data_,     &d_data_cap_,     n); }
+    void ensure_marks_(size_t n)    { ensure_buffer((void**)&d_marks_,    &d_marks_cap_,    n); }
+    void ensure_cumsum_(size_t n)   { ensure_buffer((void**)&d_cumsum_,   &d_cumsum_cap_,   n * sizeof(uint32_t)); }
+    void ensure_temp_(size_t n)     { ensure_buffer((void**)&d_temp_,     &d_temp_cap_,     n); }
+    void ensure_newlines_(size_t n) { ensure_buffer((void**)&d_newlines_, &d_newlines_cap_, n * sizeof(int64_t)); }
+    void ensure_mask_(size_t n)     { ensure_buffer((void**)&d_mask_,     &d_mask_cap_,     n * sizeof(uint8_t)); }
+    void ensure_scanned_(size_t n)  { ensure_buffer((void**)&d_scanned_,  &d_scanned_cap_,  n * sizeof(int)); }
+    void ensure_h_pinned_(size_t n) {
+        if (h_pinned_cap_ >= n) return;
+        if (h_pinned_buf_) CUDA_CHECK(cudaFreeHost(h_pinned_buf_));
+        CUDA_CHECK(cudaMallocHost(&h_pinned_buf_, n));
+        h_pinned_cap_ = n;
+    }
 
 public:
     Impl() {
         CUDA_CHECK(cudaStreamCreate(&stream_));
     }
     ~Impl() {
-        if (d_data_)   cudaFree(d_data_);
-        if (d_marks_)  cudaFree(d_marks_);
-        if (d_cumsum_) cudaFree(d_cumsum_);
-        if (d_temp_)   cudaFree(d_temp_);
-        if (stream_)   cudaStreamDestroy(stream_);
+        if (d_data_)     cudaFree(d_data_);
+        if (d_marks_)    cudaFree(d_marks_);
+        if (d_cumsum_)   cudaFree(d_cumsum_);
+        if (d_temp_)     cudaFree(d_temp_);
+        if (d_newlines_) cudaFree(d_newlines_);
+        if (d_mask_)     cudaFree(d_mask_);
+        if (d_scanned_)  cudaFree(d_scanned_);
+        if (h_pinned_buf_) cudaFreeHost(h_pinned_buf_);
+        if (stream_)     cudaStreamDestroy(stream_);
     }
 
     ParsedCSV parse(const std::string& filepath, const ParseOptions& opts) {
         using clock = std::chrono::high_resolution_clock;
         auto t0 = clock::now();
 
-        // 1. Read file into pinned host memory
-        std::ifstream ifs(filepath, std::ios::binary | std::ios::ate);
-        if (!ifs) {
+        // 1. Fast file read into reusable pinned host buffer
+        FILE* fp = fopen(filepath.c_str(), "rb");
+        if (!fp) {
             throw std::runtime_error("Cannot open file: " + filepath);
         }
-        auto file_size_host = static_cast<size_t>(ifs.tellg());
-        ifs.seekg(0, std::ios::beg);
+        fseek(fp, 0, SEEK_END);
+        auto file_size_host = static_cast<size_t>(ftell(fp));
+        fseek(fp, 0, SEEK_SET);
 
-        char* h_pinned = nullptr;
-        CUDA_CHECK(cudaMallocHost(&h_pinned, file_size_host));
-        ifs.read(h_pinned, file_size_host);
-        ifs.close();
+        ensure_h_pinned_(file_size_host);
+        char* h_pinned = h_pinned_buf_;
+        size_t bytes_read = fread(h_pinned, 1, file_size_host, fp);
+        fclose(fp);
+        if (bytes_read != file_size_host) {
+            throw std::runtime_error("Failed to read file: " + filepath);
+        }
 
         // Skip header: advance pointer/size after first newline
         size_t data_offset = 0;
@@ -418,11 +559,9 @@ public:
         }
         size_t payload_size = file_size_host - data_offset;
         if (payload_size == 0) {
-            cudaFreeHost(h_pinned);
             return {};
         }
         if (payload_size > static_cast<size_t>(std::numeric_limits<int>::max())) {
-            cudaFreeHost(h_pinned);
             throw std::runtime_error(
                 "File too large for CUB scan limit (INT_MAX bytes). "
                 "Chunked streaming mode will be added in a future update.");
@@ -471,12 +610,11 @@ public:
         result.h2d_time_ms = std::chrono::duration<double, std::milli>(t2 - t1).count();
 
         if (h_total_nl == 0) {
-            cudaFreeHost(h_pinned);
             return {};
         }
 
-        int64_t* d_newlines = nullptr;
-        CUDA_CHECK(cudaMalloc(&d_newlines, (h_total_nl + 1) * sizeof(int64_t)));
+        ensure_newlines_(h_total_nl + 1);
+        int64_t* d_newlines = d_newlines_;
         {
             int threads = 256;
             int blocks = static_cast<int>((payload_size + threads - 1) / threads);
@@ -517,18 +655,22 @@ public:
 
         result.num_rows = static_cast<size_t>(num_rows);
 
+        // Warp kernel config: 128 threads = 4 warps/block gives good occupancy
+        constexpr int WARP_THREADS = 32;
+        constexpr int THREADS_PER_BLOCK = 256;
+        int warps_per_block = THREADS_PER_BLOCK / WARP_THREADS;
+
         if (opts.fused_filter) {
             // ---- FUSED PATH ----
-            uint8_t* d_mask = nullptr;
-            int* d_scanned = nullptr;
-            CUDA_CHECK(cudaMalloc(&d_mask, num_rows * sizeof(uint8_t)));
-            CUDA_CHECK(cudaMalloc(&d_scanned, num_rows * sizeof(int)));
+            ensure_mask_(num_rows);
+            ensure_scanned_(num_rows);
+            uint8_t* d_mask = d_mask_;
+            int* d_scanned = d_scanned_;
 
-            // 6a. evaluate predicate
+            // 6a. evaluate predicate (warp per row)
             {
-                int threads = 256;
-                int blocks = static_cast<int>((num_rows + threads - 1) / threads);
-                filter_mask_kernel<<<blocks, threads, 0, stream_>>>(
+                int blocks = static_cast<int>((num_rows + warps_per_block - 1) / warps_per_block);
+                filter_mask_kernel_warp<<<blocks, THREADS_PER_BLOCK, 0, stream_>>>(
                     d_data_, d_newlines, num_rows, ends_with_newline,
                     static_cast<int64_t>(payload_size), opts.delimiter,
                     opts.predicate_col, opts.predicate_col_type, opts.predicate_op,
@@ -538,7 +680,7 @@ public:
 
             // 6b. exclusive scan mask on stream
             cub::DeviceScan::ExclusiveSum(nullptr, temp_bytes, d_mask, d_scanned,
-                                            static_cast<int>(num_rows));
+                                          static_cast<int>(num_rows));
             ensure_temp_(temp_bytes);
             cub::DeviceScan::ExclusiveSum(d_temp_, temp_bytes, d_mask, d_scanned,
                                           static_cast<int>(num_rows), stream_);
@@ -586,9 +728,8 @@ public:
                                            num_proj * sizeof(ColumnType), cudaMemcpyHostToDevice, stream_));
 
                 {
-                    int threads = 256;
-                    int blocks = static_cast<int>((num_rows + threads - 1) / threads);
-                    parse_filtered_rows_kernel<<<blocks, threads, 0, stream_>>>(
+                    int blocks = static_cast<int>((num_rows + warps_per_block - 1) / warps_per_block);
+                    parse_filtered_rows_kernel_warp<<<blocks, THREADS_PER_BLOCK, 0, stream_>>>(
                         d_data_, d_newlines, num_rows, ends_with_newline,
                         static_cast<int64_t>(payload_size), opts.delimiter,
                         num_proj, d_proj_indices, d_proj_types, d_mask,
@@ -615,8 +756,6 @@ public:
                 cudaFree(d_proj_types);
             }
 
-            cudaFree(d_mask);
-            cudaFree(d_scanned);
         } else {
             // ---- NON-FUSED PATH ----
             std::vector<void*> h_col_data(num_cols);
@@ -648,9 +787,8 @@ public:
                                        num_cols * sizeof(ColumnType), cudaMemcpyHostToDevice, stream_));
 
             {
-                int threads = 256;
-                int blocks = static_cast<int>((num_rows + threads - 1) / threads);
-                parse_rows_kernel<<<blocks, threads, 0, stream_>>>(
+                int blocks = static_cast<int>((num_rows + warps_per_block - 1) / warps_per_block);
+                parse_rows_kernel_warp<<<blocks, THREADS_PER_BLOCK, 0, stream_>>>(
                     d_data_, d_newlines, num_rows, ends_with_newline,
                     static_cast<int64_t>(payload_size), opts.delimiter,
                     num_cols, d_types, d_col_data, d_col_nulls);
@@ -676,8 +814,6 @@ public:
         }
 
         // Cleanup per-call allocations
-        cudaFree(d_newlines);
-        cudaFreeHost(h_pinned);
 
         // Final sync to ensure all stream work is done
         CUDA_CHECK(cudaStreamSynchronize(stream_));

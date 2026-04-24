@@ -13,9 +13,9 @@ int main(int argc, char** argv) {
 
     ParseOptions opts;
     opts.schema = {
-        {"id",    ColumnType::INT64},
-        {"value", ColumnType::FLOAT64},
-        {"score", ColumnType::INT64}
+        {ColumnType::INT64,   "id"},
+        {ColumnType::FLOAT64, "value"},
+        {ColumnType::INT64,   "score"}
     };
     opts.skip_header = true;
 

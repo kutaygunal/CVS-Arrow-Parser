@@ -26,3 +26,7 @@ target_link_libraries(csv_parser_cli PRIVATE gpu_csv_parser)
 # Benchmark executable
 add_executable(csv_parser_bench benchmarks/bench.cu)
 target_link_libraries(csv_parser_bench PRIVATE gpu_csv_parser)
+
+# Sweep benchmark executable
+add_executable(csv_parser_sweep benchmarks/sweep.cu)
+target_link_libraries(csv_parser_sweep PRIVATE gpu_csv_parser)

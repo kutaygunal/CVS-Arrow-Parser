@@ -6,6 +6,8 @@
 #include <string>
 #include <vector>
 
+#include <cuda_runtime.h>
+
 namespace gpu_csv {
 
 enum class ColumnType { INT64, FLOAT64 };

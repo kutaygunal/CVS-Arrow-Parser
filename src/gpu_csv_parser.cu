@@ -4,9 +4,8 @@
 #include <cuda_runtime.h>
 #include <device_launch_parameters.h>
 
-#include <cstdint.h>
-#include <fcntl.h>
-#include <stdio.h>
+#include <cstdint>
+#include <cstdio>
 
 #include <fstream>
 #include <iostream>
@@ -382,6 +381,14 @@ public:
         }
         size_t payload_size = file_size_host - data_offset;
         if (payload_size == 0) return {};
+
+        // Declare result early for timing fields
+        ParsedCSV result;
+        result.num_rows = 0;
+        result.num_filtered_rows = 0;
+        result.parse_time_ms = 0.0;
+        result.h2d_time_ms = 0.0;
+
         if (payload_size > static_cast<size_t>(std::numeric_limits<int>::max())) {
             throw std::runtime_error("File too large for CUB scan limit (INT_MAX bytes)");
         }
@@ -389,11 +396,12 @@ public:
         // 2. H2D copy
         char* d_data = nullptr;
         CUDA_CHECK(cudaMalloc(&d_data, payload_size));
-        CUDA_CHECK(cudaMemcpy(d_data, h_data.data() + data_offset, payload_size,
-                              cudaMemcpyHostToDevice));
 
         auto t1 = clock::now();
-        result.h2d_time_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        CUDA_CHECK(cudaMemcpy(d_data, h_data.data() + data_offset, payload_size,
+                              cudaMemcpyHostToDevice));
+        auto t2 = clock::now();
+        result.h2d_time_ms = std::chrono::duration<double, std::milli>(t2 - t1).count();
 
         // 3. Mark newlines
         uint8_t* d_marks = nullptr;
@@ -470,7 +478,6 @@ public:
         std::vector<ColumnType> proj_types;
         for (int idx : proj_indices) proj_types.push_back(opts.schema[idx].type);
 
-        ParsedCSV result;
         result.num_rows = static_cast<size_t>(num_rows);
 
         if (opts.fused_filter) {
@@ -497,7 +504,6 @@ public:
                                           static_cast<int>(num_rows));
             CUDA_CHECK(cudaGetLastError());
 
-            int h_survivors = 0;
             uint8_t h_last_mask = 0;
             CUDA_CHECK(cudaMemcpy(&h_last_mask, d_mask + num_rows - 1,
                                   sizeof(uint8_t), cudaMemcpyDeviceToHost));
@@ -556,8 +562,10 @@ public:
                     col.type = proj_types[pj];
                     col.num_rows = static_cast<size_t>(survivors);
                     col.data_bytes = survivors * type_size(col.type);
-                    col.data.reset(h_proj_data[pj], +[](void* p) { cudaFree(p); });
-                    col.null_mask.reset(h_proj_nulls[pj], +[](void* p) { cudaFree(p); });
+                    col.data = std::unique_ptr<void, void (*)(void*)>(
+                        h_proj_data[pj], +[](void* p) { cudaFree(p); });
+                    col.null_mask = std::unique_ptr<uint8_t, void (*)(void*)>(
+                        h_proj_nulls[pj], +[](void* p) { cudaFree(p); });
                     result.columns.push_back(std::move(col));
                 }
 
@@ -615,8 +623,10 @@ public:
                 col.type = opts.schema[c].type;
                 col.num_rows = static_cast<size_t>(num_rows);
                 col.data_bytes = col.num_rows * type_size(col.type);
-                col.data.reset(h_col_data[c], +[](void* p) { cudaFree(p); });
-                col.null_mask.reset(h_col_nulls[c], +[](void* p) { cudaFree(p); });
+                col.data = std::unique_ptr<void, void (*)(void*)>(
+                    h_col_data[c], +[](void* p) { cudaFree(p); });
+                col.null_mask = std::unique_ptr<uint8_t, void (*)(void*)>(
+                    h_col_nulls[c], +[](void* p) { cudaFree(p); });
                 result.columns.push_back(std::move(col));
             }
 
@@ -632,8 +642,9 @@ public:
         cudaFree(d_newlines);
         cudaFree(d_temp);
 
-        auto t2 = clock::now();
-        result.parse_time_ms = std::chrono::duration<double, std::milli>(t2 - t1).count();
+        // Timer end for parse operations (measured together with all device work after H2D)
+        auto t3 = clock::now();
+        result.parse_time_ms = std::chrono::duration<double, std::milli>(t3 - t2).count();
         return result;
     }
 };

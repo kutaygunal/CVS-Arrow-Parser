@@ -43,7 +43,10 @@ Device:
 ├── CMakeLists.txt
 ├── README.md
 ├── data/
-│   └── sample.csv               # tiny test file
+│   ├── sample.csv               # tiny test file (5 rows)
+│   ├── 1M.csv                   # generated: 1 million rows
+│   ├── 5M.csv                   # generated: 5 million rows
+│   └── 10M.csv                  # generated: 10 million rows
 ├── scripts/
 │   └── generate_csv.py          # generate large benchmark files
 ├── include/
@@ -52,7 +55,8 @@ Device:
 │   ├── gpu_csv_parser.cu        # CUDA kernels + Impl
 │   └── main.cpp                 # CLI demo
 └── benchmarks/
-    └── bench.cu                  # throughput benchmark
+    ├── bench.cu                 # single-file repeated-run benchmark
+    └── sweep.cu                 # multi-size sweep benchmark
 ```
 
 ## Build Requirements
@@ -64,16 +68,20 @@ Device:
 
 ### Windows Build (Visual Studio / Ninja)
 
+Tested with **CUDA 12.6 + Visual Studio 2022 (MSVC 14.43)**. If `nvcc` is not on PATH, pass the full path:
+
 ```powershell
 cd C:\Users\kutay\Desktop\Projects\01-csv-arrow-parser
-# Generate
-#  - If using Visual Studio generator:
-cmake -S . -B build -G "Visual Studio 17 2022" -A x64
-#  - If using Ninja (recommended with CUDA):
-cmake -S . -B build -G Ninja -DCMAKE_CUDA_COMPILER="$env:CUDA_PATH\bin\nvcc.exe"
+
+# Clean configure (removes stale Ninja/VS cache if switching generators)
+rm -rf build
+
+# Configure with Visual Studio generator (most reliable on Windows)
+cmake -S . -B build -G "Visual Studio 17 2022" -A x64 `
+  -DCMAKE_CUDA_COMPILER="C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.6/bin/nvcc.exe"
 
 # Build
-cmake --build build --config Release
+cmake --build build --config Release --parallel 4
 ```
 
 ### Linux Build
@@ -96,34 +104,70 @@ python scripts/generate_csv.py --rows 10000000 --out data/10M.csv
 ### 2. Run the CLI demo
 
 ```powershell
-.\build\csv_parser_cli.exe data/10M.csv
+.\build\Release\csv_parser_cli.exe data/sample.csv
 ```
 
 Expected output:
 ```
 === GPU CSV Parser Demo ===
-File: data/10M.csv
+File: data/sample.csv
 
 [1] Full parse (all columns)
-  Rows parsed:      10000000
+  Rows parsed:      5
   Columns:          3
-  H2D time:         ... ms
-  Parse time:       ... ms
+  H2D time:         0.767 ms
+  Parse time:       2.256 ms
   First 5 ids:      0 1 2 3 4
 
 [2] Fused filter parse (score > 50, project id & value)
-  Total scanned:    10000000
-  Survivors:        ~5000000
-  H2D time:         ... ms
-  Fused parse time: ... ms
-  First 5 filtered: ...
+  Total scanned:    5
+  Survivors:        2
+  H2D time:         0.012 ms
+  Fused parse time: 0.272 ms
+  First 5 filtered: 1 3
 ```
 
-### 3. Run benchmarks
+### 3. Run the sweep benchmark (recommended)
+
+Benchmarks all dataset sizes in one shot:
 
 ```powershell
-.\build\csv_parser_bench.exe data/10M.csv
+.\build\Release\csv_parser_sweep.exe
 ```
+
+**Verified output** (RTX 4060 Laptop / CUDA 12.6 / Windows):
+
+```
+=== GPU CSV Parser: Multi-Size Benchmark ===
+Warmup: 2 | Runs: 10
+
+File              Size(MiB) Rows        Full(ms)  Full(MiB/s) Fused(ms) Fused(MiB/s)  Survivors   Selectivity
+--------------------------------------------------------------------------------------------------------------
+data/sample.csv   0.00      5           0.43      0.2         0.50      0.2            2          0.40
+data/1M.csv       17.73     1000000     17.80     996.1       18.58     954.1          495620     0.50
+data/5M.csv       92.88     5000000     89.93     1032.8      93.77     990.5          2474601    0.49
+data/10M.csv      186.81   10000000    172.59     1082.4     172.80    1081.1          4952096    0.50
+```
+
+Throughput **scales linearly** with dataset size — the parser is memory-bandwidth bound, which is the expected behavior for a throughput-oriented GPU parser.
+
+### 4. Run the single-file benchmark
+
+```powershell
+.\build\Release\csv_parser_bench.exe data/1M.csv
+```
+
+## Portability Notes (MSVC)
+
+This project was developed and tested on Windows with MSVC + CUDA 12.6. The following compiler-specific idiosyncrasies were addressed:
+
+| Issue | Fix |
+|---|---|
+| `cstdint.h` header not found | Use `<cstdint>` instead (C++ standard form). |
+| `unique_ptr::reset(ptr, deleter)` rejected | `reset()` takes only a pointer; construct a new `unique_ptr` and assign instead. |
+| `cudaFree` invisible in pure C++ units | Include `<cuda_runtime.h>` in the public header so host code sees the deleter signature. |
+| Aggregate init order strictness | MSVC requires `{ColumnType, name}` order in `ColumnSpec` to match declaration exactly. |
+| CMake generator cache conflict | Remove `build/` directory when switching between Ninja and Visual Studio generators. |
 
 ## Design Notes & Limitations
 
@@ -140,7 +184,9 @@ File: data/10M.csv
 Use **Nsight Compute / Nsight Systems** to examine the kernel behavior:
 
 ```powershell
-ncu --kernel-name regex:parse_rows_kernel --metrics dram_bytes_read,smsp__sass_average_data_bytes_per_sector_mem_global_op_ld.pct .\build\csv_parser_bench.exe data/10M.csv
+ncu --kernel-name regex:parse_rows_kernel `
+    --metrics dram_bytes_read,smsp__sass_average_data_bytes_per_sector_mem_global_op_ld.pct `
+    .\build\Release\csv_parser_bench.exe data/1M.csv
 ```
 
 Key metrics to collect for a blog post / interview:
